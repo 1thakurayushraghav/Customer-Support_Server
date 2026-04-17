@@ -5,6 +5,24 @@ import User from "../models/User.js";
 import TrainingData from "../models/TrainingData.js";
 import axios from "axios";
 
+// 🔁 RETRY FUNCTION (PRODUCTION READY)
+async function callAI(url, data, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await axios.post(url, data, {
+        timeout: 20000
+      });
+    } catch (err) {
+      console.log(`⚠️ AI attempt ${i + 1} failed`);
+
+      if (i === retries) throw err;
+
+      // 🔥 delay before retry
+      await new Promise(res => setTimeout(res, 1000 * (i + 1)));
+    }
+  }
+}
+
 export const sendMessage = async (req, res) => {
   try {
     const { message, conversationId } = req.body;
@@ -47,7 +65,7 @@ export const sendMessage = async (req, res) => {
     });
 
     // ===============================
-    // 🔍 KEYWORD DETECTION (FAST)
+    // 🔍 KEYWORD DETECTION
     // ===============================
     const keywords = await KeywordAlert.find({ isActive: true }).lean();
 
@@ -66,7 +84,6 @@ export const sendMessage = async (req, res) => {
 
       const hasHighPriority = detectedKeywords.some(k => k.priority === "high");
 
-      // ✅ BULK INSERT (FAST)
       const notifications = admins.map(admin => ({
         adminId: admin._id,
         conversationId: convo._id,
@@ -82,7 +99,6 @@ export const sendMessage = async (req, res) => {
 
       const created = await Notification.insertMany(notifications);
 
-      // ✅ SOCKET EMIT (LIGHT)
       const io = req.app.get("io");
       if (io) {
         io.emit("admin_attention_needed", {
@@ -94,7 +110,6 @@ export const sendMessage = async (req, res) => {
         });
       }
 
-      // ✅ AUTO ESCALATE
       if (detectedKeywords.some(k => k.autoEscalate)) {
         convo.mode = "human";
         convo.status = "escalated";
@@ -109,7 +124,7 @@ export const sendMessage = async (req, res) => {
     }
 
     // ===============================
-    // 📚 TRAINING MATCH (FAST EXIT)
+    // 📚 TRAINING MATCH
     // ===============================
     let reply = "";
 
@@ -124,33 +139,41 @@ export const sendMessage = async (req, res) => {
       reply = match.answer;
     } else {
       // ===============================
-      // 🤖 AI CALL (SAFE)
+      // 🤖 AI CALL (STABLE)
       // ===============================
       try {
-        const history = convo.messages.slice(-10).map(m => ({
-          role: m.role === "user" ? "user" : "assistant",
-          content: m.content
-        }));
+        const history = convo.messages
+          .slice(-6)
+          .map(m => ({
+            role: m.role === "user" ? "user" : "assistant",
+            content: m.content.slice(0, 500)
+          }));
 
-        const aiRes = await axios.post(
-          `${process.env.AI_URL}/chat`,
-          { messages: history },
-          { timeout: 7000 } // ✅ important
-        );
+        const aiRes = await callAI(`${process.env.AI_URL}/chat`, {
+          messages: history
+        });
 
         reply = aiRes.data?.reply || "Sorry, I couldn't respond.";
+
       } catch (err) {
-        console.error("AI ERROR:", err.message);
-        reply = "⚠️ AI service temporarily unavailable";
+        console.error("🔥 AI ERROR FULL:", {
+          message: err.message,
+          status: err.response?.status,
+          data: err.response?.data
+        });
+
+        reply = "Our AI is busy right now. Please try again.";
       }
     }
 
     // ===============================
-    // 💬 SAVE RESPONSE
+    // 💬 SAVE RESPONSE (SAFE)
     // ===============================
-    const lastMsg = convo.messages.at(-1);
+    const lastMsg = convo.messages.length
+      ? convo.messages[convo.messages.length - 1]
+      : null;
 
-    if (!(lastMsg.role === "assistant" && lastMsg.sentBy === "system")) {
+    if (!(lastMsg?.role === "assistant" && lastMsg?.sentBy === "system")) {
       convo.messages.push({
         role: "assistant",
         content: reply,
